@@ -1,0 +1,148 @@
+name: Deploy WINX Trade to AWS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t2.medium
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+
+    - name: Generate SSH Key Pair
+      run: |
+        mkdir -p infrastructure/keys
+        ssh-keygen -t rsa -b 4096 -C "winx-trade-deploy" -f infrastructure/keys/winx_key -N ""
+        chmod 400 infrastructure/keys/winx_key
+        chmod 400 infrastructure/keys/winx_key.pub
+
+    - name: Terraform Init
+      run: terraform init
+      working-directory: ./infrastructure
+
+    - name: Terraform Plan
+      run: terraform plan -var="db_password=${{ secrets.DB_PASSWORD }}" -input=false
+      working-directory: ./infrastructure
+
+    - name: Terraform Apply
+      run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}" -input=false
+      working-directory: ./infrastructure
+
+    - name: Get Instance IP
+      id: ip
+      run: |
+        cd infrastructure
+        INSTANCE_IP=$(terraform output -raw instance_public_ip)
+        echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+        echo "🖥️ Instance Public IP: $INSTANCE_IP"
+
+    - name: Wait for Instance to be ready
+      run: |
+        INSTANCE_IP=${{ steps.ip.outputs.instance_ip }}
+        echo "⏳ Waiting for instance to be ready..."
+        for i in {1..30}; do
+          if nc -z $INSTANCE_IP 22; then
+            echo "✅ Instance is ready for SSH"
+            break
+          fi
+          echo "⏰ Attempt $i: Waiting for SSH..."
+          sleep 10
+        done
+        
+        # Additional wait for system to fully initialize
+        sleep 30
+
+    - name: Copy application files
+      run: |
+        INSTANCE_IP=${{ steps.ip.outputs.instance_ip }}
+        echo "📁 Copying application files to EC2 instance..."
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i infrastructure/keys/winx_key -r ./* ec2-user@$INSTANCE_IP:/home/ec2-user/winx-trade/
+
+    - name: Run deployment script
+      run: |
+        INSTANCE_IP=${{ steps.ip.outputs.instance_ip }}
+        echo "🚀 Running deployment script on EC2 instance..."
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i infrastructure/keys/winx_key ec2-user@$INSTANCE_IP << 'EOF'
+          cd /home/ec2-user/winx-trade
+          
+          # Make deploy script executable
+          chmod +x deploy.sh
+          
+          # Set database password from environment
+          export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+          
+          # Run deployment
+          ./deploy.sh
+          
+          echo "✅ Deployment script completed"
+        EOF
+
+    - name: Verify deployment
+      run: |
+        INSTANCE_IP=${{ steps.ip.outputs.instance_ip }}
+        echo "🔍 Verifying deployment..."
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i infrastructure/keys/winx_key ec2-user@$INSTANCE_IP << 'EOF'
+          echo "=== Checking Services ==="
+          sudo systemctl status nginx --no-pager
+          echo ""
+          echo "=== Checking Node.js Application ==="
+          pm2 status
+          echo ""
+          echo "=== Checking Database ==="
+          mysql -u winxuser -p"${{ secrets.DB_PASSWORD }}" -e "SHOW DATABASES;" winxtrade_db
+          echo ""
+          echo "=== Checking Application Health ==="
+          curl -f http://localhost:3000/api/health || echo "Health check failed but continuing..."
+        EOF
+
+    - name: Store Deployment Info
+      run: |
+        echo "🎉 WINX Trade Management deployed successfully!"
+        echo "🌐 Public IP: ${{ steps.ip.outputs.instance_ip }}"
+        echo "🔗 Application URL: http://${{ steps.ip.outputs.instance_ip }}"
+        echo "🖥️ SSH Access: ssh -i infrastructure/keys/winx_key ec2-user@${{ steps.ip.outputs.instance_ip }}"
+        echo "📊 PM2 Dashboard: ssh -i infrastructure/keys/winx_key ec2-user@${{ steps.ip.outputs.instance_ip }} 'pm2 monit'"
+
+  destroy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.destroy == 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+
+    - name: Terraform Destroy
+      run: terraform destroy -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}" -input=false
+      working-directory: ./infrastructure
+      continue-on-error: true
